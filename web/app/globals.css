@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+:root {
+  --board: #14171b;
+  --panel: #1b1f24;
+  --panel-line: #2a2f36;
+  --paper: #f4efe4;
+  --paper-dim: #a8a296;
+  --amber: #f2a93b;
+  --signal-green: #3fbf7f;
+  --signal-red: #e85c4a;
+}
+
+@theme inline {
+  --color-board: var(--board);
+  --color-panel: var(--panel);
+  --color-panel-line: var(--panel-line);
+  --color-paper: var(--paper);
+  --color-paper-dim: var(--paper-dim);
+  --color-amber: var(--amber);
+  --color-signal-green: var(--signal-green);
+  --color-signal-red: var(--signal-red);
+  --font-sans: var(--font-archivo);
+  --font-display: var(--font-space-mono);
+}
+
+body {
+  background: var(--board);
+  color: var(--paper);
+}
