@@ -2,8 +2,15 @@ const crypto = require("crypto");
 const { generateHistoryEvents } = require("./seedHistory");
 const { computeConfidence } = require("./confidence");
 const { computeFillEta, TREND_WINDOW_MINUTES } = require("./trend");
+const { compareToTypical } = require("./busyness");
+
+function isWeekend(date) {
+  const day = date.getUTCDay(); // 0=Sun ... 6=Sat
+  return day === 0 || day === 6;
+}
 
 const STALE_MINUTES = 10;
+const RETENTION_MS = 8 * 24 * 60 * 60 * 1000; // history only ever looks back 7 days
 
 const SEED_LOCATIONS = [
   { name: "Canteen", capacity: 80, category: "Canteen" },
@@ -15,7 +22,8 @@ const SEED_LOCATIONS = [
 
 let locations = [];
 let checkEvents = [];
-const activeSessions = new Set(); // `${sessionId}::${locationId}`
+// A heartbeat's presence IS "checked in" — the single source of truth, so
+// checkin/checkout/heartbeat can never disagree about a session's state.
 const heartbeats = new Map(); // `${sessionId}::${locationId}` -> { sessionId, locationId, lastPing }
 
 function key(sessionId, locationId) {
@@ -82,13 +90,13 @@ async function getLocationById(id) {
 async function checkin(locationId, sessionId) {
   const location = await getLocationById(locationId);
   if (!location) return { error: "not_found" };
-  if (activeSessions.has(key(sessionId, locationId))) {
-    return { error: "already_checked_in" };
-  }
-  activeSessions.add(key(sessionId, locationId));
+  const k = key(sessionId, locationId);
+  if (heartbeats.has(k)) return { error: "already_checked_in" };
+  if (location.currentCount >= location.capacity) return { error: "at_capacity" };
+
+  heartbeats.set(k, { sessionId, locationId, lastPing: new Date() });
   location.currentCount += 1;
   location.lastEventAt = new Date();
-  heartbeats.set(key(sessionId, locationId), { sessionId, locationId, lastPing: new Date() });
   checkEvents.push({ locationId, sessionId, action: "in", timestamp: new Date() });
   refreshConfidence(location);
   return { location: attachTrend(location) };
@@ -97,11 +105,10 @@ async function checkin(locationId, sessionId) {
 async function checkout(locationId, sessionId) {
   const location = await getLocationById(locationId);
   if (!location) return { error: "not_found" };
-  if (!activeSessions.has(key(sessionId, locationId))) {
-    return { error: "not_checked_in" };
-  }
-  activeSessions.delete(key(sessionId, locationId));
-  heartbeats.delete(key(sessionId, locationId));
+  const k = key(sessionId, locationId);
+  if (!heartbeats.has(k)) return { error: "not_checked_in" };
+
+  heartbeats.delete(k);
   location.currentCount = Math.max(0, location.currentCount - 1);
   location.lastEventAt = new Date();
   checkEvents.push({ locationId, sessionId, action: "out", timestamp: new Date() });
@@ -112,7 +119,10 @@ async function checkout(locationId, sessionId) {
 async function heartbeat(locationId, sessionId) {
   const location = await getLocationById(locationId);
   if (!location) return { error: "not_found" };
-  heartbeats.set(key(sessionId, locationId), { sessionId, locationId, lastPing: new Date() });
+  const k = key(sessionId, locationId);
+  const existing = heartbeats.get(k);
+  if (!existing) return { error: "not_checked_in" };
+  existing.lastPing = new Date();
   refreshConfidence(location);
   return { ok: true };
 }
@@ -127,18 +137,9 @@ async function runStalenessSweep() {
 
   for (const [hbKey, hb] of heartbeats) {
     if (hb.lastPing.getTime() >= cutoff) continue;
-    if (!activeSessions.has(hbKey)) {
-      heartbeats.delete(hbKey);
-      continue;
-    }
-    const location = await getLocationById(hb.locationId);
-    if (!location) {
-      heartbeats.delete(hbKey);
-      activeSessions.delete(hbKey);
-      continue;
-    }
-    activeSessions.delete(hbKey);
     heartbeats.delete(hbKey);
+    const location = await getLocationById(hb.locationId);
+    if (!location) continue;
     location.currentCount = Math.max(0, location.currentCount - 1);
     location.lastEventAt = new Date();
     checkEvents.push({ locationId: location.id, sessionId: hb.sessionId, action: "out", timestamp: new Date() });
@@ -153,6 +154,9 @@ async function runStalenessSweep() {
     if (Math.abs(before - location.confidenceScore) >= 3) changed.push(location);
   }
 
+  const pruneCutoff = Date.now() - RETENTION_MS;
+  checkEvents = checkEvents.filter((e) => e.timestamp.getTime() >= pruneCutoff);
+
   return changed.map(attachTrend);
 }
 
@@ -166,14 +170,41 @@ async function adminCorrect(locationId, currentCount) {
   return { location: attachTrend(location) };
 }
 
-async function getHistory(locationId) {
+async function getHistory(locationId, dayPart = "all") {
   const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
-  const relevant = checkEvents.filter(
-    (e) => e.locationId === locationId && e.action === "in" && e.timestamp.getTime() >= sevenDaysAgo
-  );
+  const relevant = checkEvents.filter((e) => {
+    if (e.locationId !== locationId || e.action !== "in") return false;
+    if (e.timestamp.getTime() < sevenDaysAgo) return false;
+    if (dayPart === "weekday" && isWeekend(e.timestamp)) return false;
+    if (dayPart === "weekend" && !isWeekend(e.timestamp)) return false;
+    return true;
+  });
   const totals = new Array(24).fill(0);
   for (const e of relevant) totals[e.timestamp.getUTCHours()] += 1;
-  return totals.map((sum, hour) => ({ hour, avgCheckins: Math.round((sum / 7) * 10) / 10 }));
+  const days = dayPart === "weekend" ? 2 : dayPart === "weekday" ? 5 : 7;
+  return totals.map((sum, hour) => ({ hour, avgCheckins: Math.round((sum / days) * 10) / 10 }));
+}
+
+async function getBusyness(locationId) {
+  const location = await getLocationById(locationId);
+  if (!location) return null;
+
+  const history = await getHistory(locationId);
+  const now = new Date();
+  const currentHourAvg = history[now.getUTCHours()].avgCheckins;
+
+  const topOfHour = new Date(now);
+  topOfHour.setUTCMinutes(0, 0, 0);
+  const checkinsSinceTopOfHour = checkEvents.filter(
+    (e) =>
+      e.locationId === locationId &&
+      e.action === "in" &&
+      !e.sessionId.startsWith("seed-") &&
+      e.timestamp.getTime() >= topOfHour.getTime()
+  ).length;
+  const minutesElapsedInHour = (now.getTime() - topOfHour.getTime()) / 60000;
+
+  return compareToTypical({ currentHourAvg, checkinsSinceTopOfHour, minutesElapsedInHour });
 }
 
 module.exports = {
@@ -186,4 +217,5 @@ module.exports = {
   runStalenessSweep,
   adminCorrect,
   getHistory,
+  getBusyness,
 };

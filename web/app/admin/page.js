@@ -2,10 +2,61 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { getLocations, adminCorrect } from "@/lib/api";
+import { getLocations, adminCorrect, verifyAdminToken } from "@/lib/api";
 import { getSocket } from "@/lib/socket";
+import { friendlyError } from "@/lib/errorMessages";
+import { getAdminToken, setAdminToken, clearAdminToken } from "@/lib/adminAuth";
+
+function AdminGate({ onAuthed }) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState(null);
+  const [checking, setChecking] = useState(false);
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setChecking(true);
+    setError(null);
+    try {
+      await verifyAdminToken(password);
+      setAdminToken(password);
+      onAuthed();
+    } catch (e) {
+      setError(friendlyError(e.message));
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center px-4">
+      <form onSubmit={handleSubmit} className="w-full max-w-xs flex flex-col gap-3">
+        <h1 className="font-display font-bold text-xl text-paper text-center mb-2">Admin access</h1>
+        <input
+          type="password"
+          autoFocus
+          placeholder="Admin password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          className="rounded-sm border border-panel-line bg-panel px-3 py-2.5 text-sm text-paper focus-visible:outline focus-visible:outline-2 focus-visible:outline-amber"
+        />
+        {error && <div className="text-signal-red text-xs">{error}</div>}
+        <button
+          type="submit"
+          disabled={checking || !password}
+          className="rounded-sm bg-amber text-board font-display font-bold text-sm uppercase tracking-widest py-2.5 hover:bg-amber/90 disabled:opacity-40"
+        >
+          {checking ? "···" : "Enter"}
+        </button>
+        <Link href="/" className="text-xs text-paper-dim hover:text-amber transition-colors text-center mt-2">
+          ← All locations
+        </Link>
+      </form>
+    </div>
+  );
+}
 
 export default function AdminPage() {
+  const [authed, setAuthed] = useState(null); // null = checking stored token
   const [locations, setLocations] = useState([]);
   const [drafts, setDrafts] = useState({});
   const [busyId, setBusyId] = useState(null);
@@ -13,6 +64,22 @@ export default function AdminPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    const token = getAdminToken();
+    if (!token) {
+      setAuthed(false);
+      return;
+    }
+    verifyAdminToken(token)
+      .then(() => setAuthed(true))
+      .catch(() => {
+        clearAdminToken();
+        setAuthed(false);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (!authed) return;
+
     getLocations()
       .then(setLocations)
       .catch(() => setError("Lost connection to SpotCheck. Refresh to try again."))
@@ -24,7 +91,7 @@ export default function AdminPage() {
     };
     socket.on("location:update", onUpdate);
     return () => socket.off("location:update", onUpdate);
-  }, []);
+  }, [authed]);
 
   async function handleSubmit(location) {
     const raw = drafts[location.id];
@@ -38,11 +105,19 @@ export default function AdminPage() {
       setLocations((prev) => prev.map((l) => (l.id === updated.id ? updated : l)));
       setDrafts((prev) => ({ ...prev, [location.id]: undefined }));
     } catch (e) {
-      setError(e.message);
+      if (e.message === "unauthorized") {
+        clearAdminToken();
+        setAuthed(false);
+        return;
+      }
+      setError(friendlyError(e.message));
     } finally {
       setBusyId(null);
     }
   }
+
+  if (authed === null) return null;
+  if (!authed) return <AdminGate onAuthed={() => setAuthed(true)} />;
 
   return (
     <div className="min-h-screen px-4 py-8 sm:px-8">
@@ -53,10 +128,6 @@ export default function AdminPage() {
 
         <header className="mt-4 mb-6">
           <h1 className="font-display font-bold text-2xl tracking-tight text-paper">Admin correction</h1>
-          <p className="text-xs text-signal-red mt-2 border border-signal-red/40 bg-signal-red/10 rounded-md px-3 py-2">
-            Unprotected — anyone with this URL can change counts. No auth in this build; put this behind
-            real authentication before production.
-          </p>
         </header>
 
         {error && (

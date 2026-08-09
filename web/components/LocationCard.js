@@ -7,6 +7,7 @@ import Gauge from "./Gauge";
 export default function LocationCard({ location, checkedIn, busy, onToggle }) {
   const prevCount = useRef(location.currentCount);
   const [flash, setFlash] = useState(false);
+  const atCapacity = !checkedIn && location.currentCount >= location.capacity;
 
   useEffect(() => {
     if (prevCount.current !== location.currentCount) {
@@ -49,14 +50,16 @@ export default function LocationCard({ location, checkedIn, busy, onToggle }) {
 
       <button
         onClick={() => onToggle(location)}
-        disabled={busy}
+        disabled={busy || atCapacity}
         className={`w-full rounded-sm py-3.5 font-display font-bold text-sm uppercase tracking-widest transition-colors disabled:opacity-40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-amber focus-visible:outline-offset-2 ${
-          checkedIn
+          atCapacity
+            ? "bg-signal-red/15 text-signal-red border border-signal-red/40 cursor-not-allowed"
+            : checkedIn
             ? "bg-board text-paper border border-panel-line hover:border-amber/60"
             : "bg-amber text-board hover:bg-amber/90"
         }`}
       >
-        {busy ? "···" : checkedIn ? "I'm leaving" : "I'm here"}
+        {busy ? "···" : atCapacity ? "Full" : checkedIn ? "I'm leaving" : "I'm here"}
       </button>
     </div>
   );

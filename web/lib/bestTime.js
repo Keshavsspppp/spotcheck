@@ -1,4 +1,4 @@
-import { formatHour } from "./formatHour";
+import { formatHour } from "./formatHour.js";
 
 // Quietest contiguous 2-hour window from the hourly history data.
 export function bestTimeToGo(history) {

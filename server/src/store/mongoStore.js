@@ -4,6 +4,7 @@ const { Location, CheckEvent, Heartbeat } = require("./models");
 const { generateHistoryEvents } = require("./seedHistory");
 const { computeConfidence } = require("./confidence");
 const { computeFillEta, TREND_WINDOW_MINUTES } = require("./trend");
+const { compareToTypical } = require("./busyness");
 
 // ponytail: some Windows/router DNS resolvers refuse SRV queries (ECONNREFUSED
 // on querySrv) that mongodb+srv:// needs, even though normal lookups work.
@@ -33,6 +34,16 @@ function toLocation(doc) {
   };
 }
 
+function trendFor(doc, counts) {
+  const fillEtaMinutes = computeFillEta({
+    capacity: doc.capacity,
+    currentCount: doc.currentCount,
+    recentIn: counts?.in || 0,
+    recentOut: counts?.out || 0,
+  });
+  return { ...toLocation(doc), fillEtaMinutes };
+}
+
 async function attachTrend(doc) {
   const cutoff = new Date(Date.now() - TREND_WINDOW_MINUTES * 60 * 1000);
   const events = await CheckEvent.find({
@@ -41,27 +52,23 @@ async function attachTrend(doc) {
     action: { $in: ["in", "out"] },
     sessionId: { $not: /^seed-/ },
   });
-  let recentIn = 0;
-  let recentOut = 0;
-  for (const e of events) (e.action === "in" ? recentIn++ : recentOut++);
-
-  const fillEtaMinutes = computeFillEta({
-    capacity: doc.capacity,
-    currentCount: doc.currentCount,
-    recentIn,
-    recentOut,
-  });
-  return { ...toLocation(doc), fillEtaMinutes };
+  const counts = { in: 0, out: 0 };
+  for (const e of events) counts[e.action]++;
+  return trendFor(doc, counts);
 }
 
+// Confidence is a derived/display field, not part of the count's correctness —
+// update it with a targeted $set so it can never clobber a concurrent
+// currentCount change the way a full doc.save() could.
 async function refreshConfidence(doc) {
   const activeHeartbeats = await Heartbeat.countDocuments({ locationId: doc._id });
-  doc.confidenceScore = computeConfidence({
+  const confidenceScore = computeConfidence({
     lastEventAt: doc.lastEventAt,
     currentCount: doc.currentCount,
     activeHeartbeats,
   });
-  await doc.save();
+  await Location.updateOne({ _id: doc._id }, { $set: { confidenceScore } });
+  doc.confidenceScore = confidenceScore;
   return doc;
 }
 
@@ -80,7 +87,24 @@ async function init() {
 
 async function getLocations() {
   const docs = await Location.find();
-  return Promise.all(docs.map(attachTrend));
+  if (!docs.length) return [];
+
+  // One batched query for all locations' recent events instead of N+1.
+  const cutoff = new Date(Date.now() - TREND_WINDOW_MINUTES * 60 * 1000);
+  const events = await CheckEvent.find({
+    locationId: { $in: docs.map((d) => d._id) },
+    timestamp: { $gte: cutoff },
+    action: { $in: ["in", "out"] },
+    sessionId: { $not: /^seed-/ },
+  });
+  const countsByLocation = new Map();
+  for (const e of events) {
+    const k = e.locationId.toString();
+    if (!countsByLocation.has(k)) countsByLocation.set(k, { in: 0, out: 0 });
+    countsByLocation.get(k)[e.action]++;
+  }
+
+  return docs.map((doc) => trendFor(doc, countsByLocation.get(doc._id.toString())));
 }
 
 async function getLocationById(id) {
@@ -88,52 +112,69 @@ async function getLocationById(id) {
   return doc ? toLocation(doc) : null;
 }
 
-async function isCheckedIn(locationId, sessionId) {
-  const last = await CheckEvent.findOne({ locationId, sessionId }).sort({ timestamp: -1 });
-  return !!last && last.action === "in";
-}
-
+// Heartbeat's unique (sessionId, locationId) index is the source of truth for
+// "is this session checked in here" — its presence/absence is updated
+// atomically below, so two concurrent requests can't both succeed at
+// checking the same session into the same location.
 async function checkin(locationId, sessionId) {
-  const doc = await Location.findById(locationId).catch(() => null);
-  if (!doc) return { error: "not_found" };
-  if (await isCheckedIn(locationId, sessionId)) return { error: "already_checked_in" };
+  const location = await Location.findById(locationId).catch(() => null);
+  if (!location) return { error: "not_found" };
 
-  doc.currentCount += 1;
-  doc.lastEventAt = new Date();
-  await doc.save();
-  await CheckEvent.create({ locationId, sessionId, action: "in" });
-  await Heartbeat.findOneAndUpdate(
-    { sessionId, locationId },
-    { lastPing: new Date() },
-    { upsert: true }
+  let hb;
+  try {
+    hb = await Heartbeat.create({ sessionId, locationId, lastPing: new Date() });
+  } catch (err) {
+    if (err.code === 11000) return { error: "already_checked_in" };
+    throw err;
+  }
+
+  // Atomic, capacity-guarded increment: only matches (and only increments)
+  // if currentCount is still below capacity at the moment MongoDB applies
+  // the update, so two simultaneous check-ins can't both slip in over the
+  // limit the way a separate read-then-save would allow.
+  const updated = await Location.findOneAndUpdate(
+    { _id: locationId, $expr: { $lt: ["$currentCount", "$capacity"] } },
+    { $inc: { currentCount: 1 }, $set: { lastEventAt: new Date() } },
+    { new: true }
   );
-  await refreshConfidence(doc);
-  return { location: await attachTrend(doc) };
+
+  if (!updated) {
+    await Heartbeat.deleteOne({ _id: hb._id });
+    return { error: "at_capacity" };
+  }
+
+  await CheckEvent.create({ locationId, sessionId, action: "in" });
+  await refreshConfidence(updated);
+  return { location: await attachTrend(updated) };
 }
 
 async function checkout(locationId, sessionId) {
-  const doc = await Location.findById(locationId).catch(() => null);
-  if (!doc) return { error: "not_found" };
-  if (!(await isCheckedIn(locationId, sessionId))) return { error: "not_checked_in" };
+  const deleted = await Heartbeat.findOneAndDelete({ sessionId, locationId });
+  if (!deleted) return { error: "not_checked_in" };
 
-  doc.currentCount = Math.max(0, doc.currentCount - 1);
-  doc.lastEventAt = new Date();
-  await doc.save();
+  // Pipeline update: floors at 0 using the document's own field, atomically —
+  // no read-then-clamp-then-save round trip for another request to race.
+  const updated = await Location.findOneAndUpdate(
+    { _id: locationId },
+    [{ $set: { currentCount: { $max: [0, { $add: ["$currentCount", -1] }] }, lastEventAt: new Date() } }],
+    { new: true }
+  ).catch(() => null);
+  if (!updated) return { error: "not_found" };
+
   await CheckEvent.create({ locationId, sessionId, action: "out" });
-  await Heartbeat.deleteOne({ sessionId, locationId });
-  await refreshConfidence(doc);
-  return { location: await attachTrend(doc) };
+  await refreshConfidence(updated);
+  return { location: await attachTrend(updated) };
 }
 
 async function heartbeat(locationId, sessionId) {
+  // Refresh-only, never upsert: a ping for a session that isn't actually
+  // checked in (per the Heartbeat gate above) shouldn't be able to manufacture
+  // "active" coverage for a location's confidence score out of nothing.
+  const hb = await Heartbeat.findOneAndUpdate({ sessionId, locationId }, { lastPing: new Date() });
+  if (!hb) return { error: "not_checked_in" };
+
   const doc = await Location.findById(locationId).catch(() => null);
-  if (!doc) return { error: "not_found" };
-  await Heartbeat.findOneAndUpdate(
-    { sessionId, locationId },
-    { lastPing: new Date() },
-    { upsert: true }
-  );
-  await refreshConfidence(doc);
+  if (doc) await refreshConfidence(doc);
   return { ok: true };
 }
 
@@ -147,22 +188,22 @@ async function runStalenessSweep() {
   const changedIds = new Set();
 
   for (const hb of stale) {
-    if (!(await isCheckedIn(hb.locationId, hb.sessionId))) {
-      await Heartbeat.deleteOne({ _id: hb._id });
-      continue;
-    }
-    const doc = await Location.findById(hb.locationId).catch(() => null);
-    if (!doc) {
-      await Heartbeat.deleteOne({ _id: hb._id });
-      continue;
-    }
-    doc.currentCount = Math.max(0, doc.currentCount - 1);
-    doc.lastEventAt = new Date();
-    await doc.save();
-    await CheckEvent.create({ locationId: doc._id, sessionId: hb.sessionId, action: "out" });
-    await Heartbeat.deleteOne({ _id: hb._id });
-    await refreshConfidence(doc);
-    changedIds.add(doc._id.toString());
+    // Atomic delete-if-present: if the user checked out themselves in the
+    // instant between the find above and here, this is a no-op instead of a
+    // double-decrement.
+    const deleted = await Heartbeat.findOneAndDelete({ _id: hb._id });
+    if (!deleted) continue;
+
+    const updated = await Location.findOneAndUpdate(
+      { _id: hb.locationId },
+      [{ $set: { currentCount: { $max: [0, { $add: ["$currentCount", -1] }] }, lastEventAt: new Date() } }],
+      { new: true }
+    ).catch(() => null);
+    if (!updated) continue;
+
+    await CheckEvent.create({ locationId: hb.locationId, sessionId: hb.sessionId, action: "out" });
+    await refreshConfidence(updated);
+    changedIds.add(updated._id.toString());
   }
 
   const changed = [];
@@ -181,17 +222,27 @@ async function runStalenessSweep() {
 }
 
 async function adminCorrect(locationId, currentCount) {
-  const doc = await Location.findById(locationId).catch(() => null);
-  if (!doc) return { error: "not_found" };
-  doc.currentCount = Math.max(0, Math.min(doc.capacity, Math.round(currentCount)));
-  doc.lastEventAt = new Date();
-  await doc.save();
+  const rounded = Math.round(currentCount);
+  const updated = await Location.findOneAndUpdate(
+    { _id: locationId },
+    [
+      {
+        $set: {
+          currentCount: { $max: [0, { $min: ["$capacity", rounded] }] },
+          lastEventAt: new Date(),
+        },
+      },
+    ],
+    { new: true }
+  ).catch(() => null);
+  if (!updated) return { error: "not_found" };
+
   await CheckEvent.create({ locationId, sessionId: "admin", action: "correction" });
-  await refreshConfidence(doc);
-  return { location: await attachTrend(doc) };
+  await refreshConfidence(updated);
+  return { location: await attachTrend(updated) };
 }
 
-async function getHistory(locationId) {
+async function getHistory(locationId, dayPart = "all") {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
   const rows = await CheckEvent.aggregate([
     {
@@ -201,11 +252,42 @@ async function getHistory(locationId) {
         timestamp: { $gte: sevenDaysAgo },
       },
     },
-    { $group: { _id: { $hour: "$timestamp" }, count: { $sum: 1 } } },
+    { $addFields: { hour: { $hour: "$timestamp" }, dow: { $dayOfWeek: "$timestamp" } } }, // dow: 1=Sun...7=Sat
+    {
+      $match:
+        dayPart === "weekday"
+          ? { dow: { $nin: [1, 7] } }
+          : dayPart === "weekend"
+          ? { dow: { $in: [1, 7] } }
+          : {},
+    },
+    { $group: { _id: "$hour", count: { $sum: 1 } } },
   ]);
   const totals = new Array(24).fill(0);
   for (const row of rows) totals[row._id] = row.count;
-  return totals.map((sum, hour) => ({ hour, avgCheckins: Math.round((sum / 7) * 10) / 10 }));
+  const days = dayPart === "weekend" ? 2 : dayPart === "weekday" ? 5 : 7;
+  return totals.map((sum, hour) => ({ hour, avgCheckins: Math.round((sum / days) * 10) / 10 }));
+}
+
+async function getBusyness(locationId) {
+  const doc = await Location.findById(locationId).catch(() => null);
+  if (!doc) return null;
+
+  const history = await getHistory(locationId);
+  const now = new Date();
+  const currentHourAvg = history[now.getUTCHours()].avgCheckins;
+
+  const topOfHour = new Date(now);
+  topOfHour.setUTCMinutes(0, 0, 0);
+  const checkinsSinceTopOfHour = await CheckEvent.countDocuments({
+    locationId,
+    action: "in",
+    sessionId: { $not: /^seed-/ },
+    timestamp: { $gte: topOfHour },
+  });
+  const minutesElapsedInHour = (now.getTime() - topOfHour.getTime()) / 60000;
+
+  return compareToTypical({ currentHourAvg, checkinsSinceTopOfHour, minutesElapsedInHour });
 }
 
 module.exports = {
@@ -218,4 +300,5 @@ module.exports = {
   runStalenessSweep,
   adminCorrect,
   getHistory,
+  getBusyness,
 };

@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect } from "react";
-import { getSessionId, getCheckedInIds } from "@/lib/session";
+import { getSessionId, getCheckedInIds, setCheckedIn } from "@/lib/session";
 import { heartbeat } from "@/lib/api";
+import { correctedCheckedInState } from "@/lib/errorMessages";
 
 const PING_INTERVAL_MS = 150000; // 2.5 min, within the spec's 2-3 min window
 
@@ -16,7 +17,13 @@ export default function Heartbeat() {
 
     function ping() {
       for (const locationId of getCheckedInIds()) {
-        heartbeat(locationId, sessionId).catch(() => {});
+        heartbeat(locationId, sessionId).catch((e) => {
+          // A rejected ping (e.g. the server already auto-checked us out via
+          // the staleness sweep) means our local state is stale — fix it here
+          // instead of waiting for the user to tap a button that will fail.
+          const corrected = correctedCheckedInState(e.message);
+          if (corrected === false) setCheckedIn(locationId, false);
+        });
       }
     }
 

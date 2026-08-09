@@ -1,6 +1,14 @@
 const express = require("express");
 const store = require("./store");
 
+function requireAdminToken(req, res, next) {
+  const token = req.header("x-admin-token");
+  if (!process.env.ADMIN_TOKEN || token !== process.env.ADMIN_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
+}
+
 function createRouter(io) {
   const router = express.Router();
 
@@ -41,12 +49,17 @@ function createRouter(io) {
   });
 
   router.get("/locations/:id/history", async (req, res) => {
-    res.json(await store.getHistory(req.params.id));
+    const dayPart = ["weekday", "weekend"].includes(req.query.dayPart) ? req.query.dayPart : "all";
+    res.json(await store.getHistory(req.params.id, dayPart));
   });
 
-  // Unprotected by design for hackathon scope — put this behind real auth
-  // (and an audit trail beyond the "correction" CheckEvent) before production.
-  router.post("/admin/correction", async (req, res) => {
+  router.get("/locations/:id/busyness", async (req, res) => {
+    res.json(await store.getBusyness(req.params.id));
+  });
+
+  router.get("/admin/verify", requireAdminToken, (req, res) => res.json({ ok: true }));
+
+  router.post("/admin/correction", requireAdminToken, async (req, res) => {
     const { locationId, currentCount } = req.body;
     if (!locationId || typeof currentCount !== "number") {
       return res.status(400).json({ error: "locationId and currentCount are required" });

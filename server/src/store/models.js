@@ -15,6 +15,7 @@ const CheckEventSchema = new mongoose.Schema({
   action: { type: String, enum: ["in", "out", "correction"], required: true },
   timestamp: { type: Date, default: Date.now },
 });
+CheckEventSchema.index({ locationId: 1, timestamp: -1 });
 
 const HeartbeatSchema = new mongoose.Schema({
   sessionId: { type: String, required: true },

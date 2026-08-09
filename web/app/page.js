@@ -7,6 +7,8 @@ import Heatmap from "@/components/Heatmap";
 import { getLocations, checkin, checkout } from "@/lib/api";
 import { getSessionId, isCheckedIn, setCheckedIn } from "@/lib/session";
 import { getSocket } from "@/lib/socket";
+import { friendlyError, correctedCheckedInState } from "@/lib/errorMessages";
+import { useSocketStatus } from "@/lib/useSocketStatus";
 
 export default function Home() {
   const [locations, setLocations] = useState([]);
@@ -15,6 +17,7 @@ export default function Home() {
   const [busyId, setBusyId] = useState(null);
   const [checkedInMap, setCheckedInMap] = useState({});
   const [sessionId, setSessionId] = useState(null);
+  const socketConnected = useSocketStatus();
 
   useEffect(() => {
     const id = getSessionId();
@@ -51,7 +54,12 @@ export default function Home() {
       setCheckedInMap((prev) => ({ ...prev, [location.id]: !currentlyIn }));
       setLocations((prev) => prev.map((l) => (l.id === updated.id ? updated : l)));
     } catch (e) {
-      setError(e.message);
+      setError(friendlyError(e.message));
+      const corrected = correctedCheckedInState(e.message);
+      if (corrected !== null) {
+        setCheckedIn(location.id, corrected);
+        setCheckedInMap((prev) => ({ ...prev, [location.id]: corrected }));
+      }
     } finally {
       setBusyId(null);
     }
@@ -67,8 +75,14 @@ export default function Home() {
           </div>
           <div className="flex items-center gap-4 shrink-0">
             <div className="flex items-center gap-2">
-              <span className="h-2 w-2 rounded-full bg-signal-green motion-safe:animate-pulse" />
-              <span className="text-xs font-bold tracking-widest text-paper-dim">LIVE</span>
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  socketConnected ? "bg-signal-green motion-safe:animate-pulse" : "bg-signal-red"
+                }`}
+              />
+              <span className="text-xs font-bold tracking-widest text-paper-dim">
+                {socketConnected ? "LIVE" : "RECONNECTING"}
+              </span>
             </div>
             <Link href="/admin" className="text-xs text-paper-dim hover:text-amber transition-colors">
               Admin

@@ -18,6 +18,10 @@ export const metadata = {
   description: "Live occupancy tracking for campus locations",
 };
 
+export const viewport = {
+  themeColor: "#14171b",
+};
+
 export default function RootLayout({ children }) {
   return (
     <html lang="en" className={`${archivo.variable} ${spaceMono.variable} h-full antialiased`}>
